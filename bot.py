@@ -63,7 +63,7 @@ DB_PATH = os.getenv("DB_PATH", "bot2.db").strip() or "bot2.db"
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "backups")); BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY", "").strip()
 BOT_VERSION = "4.0.0-multibot"
-DB_VERSION = 10
+DB_VERSION = 11
 STARTED_AT = time.monotonic()
 LAST_ERROR = ""
 ERROR_LOG_MAX = 300
@@ -361,6 +361,15 @@ def init_db():
                 message_id INTEGER NOT NULL,
                 PRIMARY KEY(broadcast_id,user_id,message_id)
             );
+            CREATE TABLE IF NOT EXISTS child_bot_broadcast_recipients(
+                broadcast_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT DEFAULT '',
+                sent_at TEXT DEFAULT '',
+                PRIMARY KEY(broadcast_id,user_id)
+            );
             CREATE TABLE IF NOT EXISTS child_bot_logs(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 child_bot_id INTEGER NOT NULL,
@@ -387,6 +396,17 @@ def init_db():
         cols = {r[1] for r in con.execute("PRAGMA table_info(child_bot_broadcasts)")}
         if "payload_json" not in cols: con.execute("ALTER TABLE child_bot_broadcasts ADD COLUMN payload_json TEXT DEFAULT ''")
         if "buttons_json" not in cols: con.execute("ALTER TABLE child_bot_broadcasts ADD COLUMN buttons_json TEXT DEFAULT ''")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS child_bot_broadcast_recipients(
+                broadcast_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT DEFAULT '',
+                sent_at TEXT DEFAULT '',
+                PRIMARY KEY(broadcast_id,user_id)
+            )
+        """)
 
         defaults = {
             "welcome": "👋 <b>Welcome!</b>\n\n🛑 Join all required channels below.\n\n💣 Then click <b>✅ Joined</b>",
@@ -632,11 +652,15 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cb_check(update, ctx):
     q = update.callback_query; uid = q.from_user.id
-    if user_status(uid) == "blocked": return await q.answer("🚫 You are blocked.", show_alert=True)
-    await q.answer(); rows = channels(False); ok, joined = await check_joined(ctx.bot, uid)
+    if user_status(uid) == "blocked":
+        return await q.answer("🚫 You are blocked.", show_alert=True)
+    rows = channels(False); ok, joined = await check_joined(ctx.bot, uid)
     if ok:
-        try: await q.edit_message_text(gset("postjoin"), reply_markup=main_kb(), parse_mode=ParseMode.HTML)
-        except TelegramError: await ctx.bot.send_message(q.message.chat_id, gset("postjoin"), reply_markup=main_kb(), parse_mode=ParseMode.HTML)
+        await q.answer()
+        try:
+            await q.edit_message_text(gset("postjoin"), reply_markup=main_kb(), parse_mode=ParseMode.HTML)
+        except TelegramError:
+            await ctx.bot.send_message(q.message.chat_id, gset("postjoin"), reply_markup=main_kb(), parse_mode=ParseMode.HTML)
     else:
         await q.answer("🚫 Join every required channel, then press ✅ Joined again.", show_alert=True)
         try: await q.message.delete()
@@ -717,7 +741,7 @@ def child_rows(child_id, enabled_only=False):
 
 def child_users(child_id, include_blocked=False):
     q = "SELECT user_id FROM child_bot_users WHERE child_bot_id=?"
-    if not include_blocked: q += " AND status!='blocked'"
+    if not include_blocked: q += " AND status='active'"
     with db() as con: return [r[0] for r in con.execute(q,(child_id,))]
 
 
@@ -871,16 +895,23 @@ class ChildBotManager:
         with db() as con: return con.execute("SELECT id,bot_id,username,first_name,display_name,owner_user_id,status,created_at,last_error,last_heartbeat FROM child_bots WHERE status!='REMOVED' ORDER BY id DESC").fetchall()
 
     async def register_child_bot(self, child_id):
-        if child_id in self.apps: return self.apps[child_id]
+        if child_id in self.apps:
+            return self.apps[child_id]
         record=child_get(child_id)
-        if not record: raise ValueError("Child bot not found")
+        if not record:
+            raise ValueError("Child bot not found")
         token=decrypt_secret(record[5])
-        app=(Application.builder().token(token).concurrent_updates(False).build())
-        app.bot_data["child_id"]=child_id
-        self._register_handlers(app)
-        self.apps[child_id]=app
-        self.locks.setdefault(child_id,asyncio.Lock())
-        return app
+        try:
+            app=(Application.builder().token(token).concurrent_updates(False).build())
+            app.bot_data["child_id"]=child_id
+            self._register_handlers(app)
+            self.locks.setdefault(child_id,asyncio.Lock())
+            self.apps[child_id]=app
+            return app
+        except Exception:
+            # Never retain a partially constructed runtime.
+            self.apps.pop(child_id,None)
+            raise
 
     def _register_handlers(self,app):
         app.add_handler(CommandHandler("start",child_start))
@@ -894,35 +925,58 @@ class ChildBotManager:
         app.add_error_handler(child_error_handler)
 
     async def start_child_bot(self, child_id):
-        record=self.get_child_bot(child_id)
-        if not record:
-            raise ValueError("Child bot not found")
-        if child_id in self.apps:
-            app=self.apps[child_id]
-        else:
-            app=await self.register_child_bot(child_id)
-        if app.running: return True
-        try:
-            await app.initialize()
-            await app.start()
-            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-            self.apps[child_id]=app
-            with db() as con: con.execute("UPDATE child_bots SET status='RUNNING',last_started_at=?,last_heartbeat=?,last_error='',updated_at=? WHERE id=?",(now_iso(),now_iso(),now_iso(),child_id))
-            return True
-        except TelegramError as e:
-            text=sanitize_error(e)
-            status="TOKEN_INVALID" if any(x in text.lower() for x in ("unauthorized","invalid bot token","token is invalid","not found")) else "ERROR"
-            update_child_status(child_id,status,text)
-            if status=="TOKEN_INVALID" and MASTER_BOT_REF and OWNER_ID:
-                try:
-                    await MASTER_BOT_REF.send_message(OWNER_ID, f"🔐 <b>CHILD BOT TOKEN INVALID</b>\n\nChild ID: <code>{child_id}</code>\nBot ID: <code>{record[1]}</code>\nUsername: <b>@{esc(record[2]) if record[2] else '—'}</b>\n\nThe child runtime was stopped. Reconfigure with a new BotFather token.", parse_mode=ParseMode.HTML)
-                except TelegramError: pass
-            await self._safe_close_app(child_id)
-            return False
-        except Exception as e:
-            update_child_status(child_id,"ERROR",e)
-            await self._safe_close_app(child_id)
-            return False
+        self.locks.setdefault(child_id,asyncio.Lock())
+        async with self.locks[child_id]:
+            record=self.get_child_bot(child_id)
+            if not record:
+                raise ValueError("Child bot not found")
+            if record[7] in ("REMOVED","DISABLED"):
+                return False
+            app=None
+            try:
+                if child_id in self.apps:
+                    app=self.apps[child_id]
+                else:
+                    app=await self.register_child_bot(child_id)
+                if app.running:
+                    touch_child(child_id)
+                    return True
+                await app.initialize()
+                await app.start()
+                if app.updater and not app.updater.running:
+                    await app.updater.start_polling(
+                        allowed_updates=Update.ALL_TYPES,
+                        drop_pending_updates=True
+                    )
+                if not app.updater or not app.updater.running:
+                    raise RuntimeError("Child updater did not start.")
+                with db() as con:
+                    con.execute(
+                        "UPDATE child_bots SET status='RUNNING',last_started_at=?,last_heartbeat=?,last_error='',updated_at=? WHERE id=?",
+                        (now_iso(),now_iso(),now_iso(),child_id)
+                    )
+                return True
+            except TelegramError as e:
+                text=sanitize_error(e)
+                status="TOKEN_INVALID" if any(x in text.lower() for x in ("unauthorized","invalid bot token","token is invalid","not found")) else "ERROR"
+                update_child_status(child_id,status,text)
+                if status=="TOKEN_INVALID" and MASTER_BOT_REF and OWNER_ID:
+                    try:
+                        await MASTER_BOT_REF.send_message(
+                            OWNER_ID,
+                            f"🔐 <b>CHILD BOT TOKEN INVALID</b>\n\nChild ID: <code>{child_id}</code>\nBot ID: <code>{record[1]}</code>\nUsername: <b>@{esc(record[2]) if record[2] else '—'}</b>\n\nThe child runtime was stopped. Reconfigure with a new BotFather token.",
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except TelegramError:
+                        logger.warning("Could not notify owner about invalid child token (child=%s)", child_id)
+                await self._safe_close_app(child_id)
+                return False
+            except Exception as e:
+                text=sanitize_error(e)
+                update_child_status(child_id,"ERROR",text)
+                await self._safe_close_app(child_id)
+                logger.exception("Child %s startup failed: %s",child_id,text)
+                return False
 
     async def _safe_close_app(self,child_id):
         app=self.apps.pop(child_id,None)
@@ -937,19 +991,31 @@ class ChildBotManager:
         except Exception: pass
 
     async def stop_child_bot(self, child_id, status="STOPPED"):
-        app=self.apps.get(child_id)
-        if app:
-            try:
-                if app.updater and app.updater.running: await app.updater.stop()
-            except Exception as e: logger.warning("Child updater stop %s: %s",child_id,sanitize_error(e))
-            try:
-                if app.running: await app.stop()
-            except Exception as e: logger.warning("Child app stop %s: %s",child_id,sanitize_error(e))
-            try: await app.shutdown()
-            except Exception as e: logger.warning("Child shutdown %s: %s",child_id,sanitize_error(e))
-            self.apps.pop(child_id,None)
-        with db() as con: con.execute("UPDATE child_bots SET status=?,last_stopped_at=?,updated_at=? WHERE id=?",(status,now_iso(),now_iso(),child_id))
-        return True
+        self.locks.setdefault(child_id,asyncio.Lock())
+        async with self.locks[child_id]:
+            app=self.apps.get(child_id)
+            if app:
+                try:
+                    if app.updater and app.updater.running:
+                        await app.updater.stop()
+                except Exception as e:
+                    logger.warning("Child updater stop %s: %s",child_id,sanitize_error(e))
+                try:
+                    if app.running:
+                        await app.stop()
+                except Exception as e:
+                    logger.warning("Child app stop %s: %s",child_id,sanitize_error(e))
+                try:
+                    await app.shutdown()
+                except Exception as e:
+                    logger.warning("Child shutdown %s: %s",child_id,sanitize_error(e))
+                self.apps.pop(child_id,None)
+            with db() as con:
+                con.execute(
+                    "UPDATE child_bots SET status=?,last_stopped_at=?,updated_at=? WHERE id=?",
+                    (status,now_iso(),now_iso(),child_id)
+                )
+            return True
 
     async def restart_child_bot(self, child_id):
         await self.stop_child_bot(child_id,"STOPPED")
@@ -987,7 +1053,11 @@ class ChildBotManager:
                     await self._safe_close_app(cid)
                     results.append((cid,status))
             else:
-                results.append((cid,row[6]))
+                stored=row[6]
+                if stored=="RUNNING":
+                    update_child_status(cid,"ERROR","Runtime is not loaded.")
+                    stored="ERROR"
+                results.append((cid,stored))
         return results
 
     async def broadcast_to_child_bot(self, child_id, payload, buttons):
@@ -1016,11 +1086,18 @@ class ChildBotManager:
 
     def failed_recipients(self,bid):
         with db() as con:
-            row=con.execute("SELECT child_bot_id,payload_json,buttons_json FROM child_bot_broadcasts WHERE broadcast_id=?",(bid,)).fetchone()
-            sent={r[0] for r in con.execute("SELECT user_id FROM child_bot_broadcast_messages WHERE broadcast_id=?",(bid,)).fetchall()}
-        if not row: return None
+            row=con.execute(
+                "SELECT child_bot_id,payload_json,buttons_json FROM child_bot_broadcasts WHERE broadcast_id=?",
+                (bid,)
+            ).fetchone()
+            if not row:
+                return None
+            failed_rows=con.execute(
+                "SELECT user_id FROM child_bot_broadcast_recipients WHERE broadcast_id=? AND status='failed' AND last_error NOT LIKE 'forbidden/%' ORDER BY user_id",
+                (bid,)
+            ).fetchall()
         child_id,payload_json,buttons_json=row
-        return child_id,json.loads(payload_json or "{}"),json.loads(buttons_json or "[]"),[uid for uid in child_users(child_id) if uid not in sent]
+        return child_id,json.loads(payload_json or "{}"),json.loads(buttons_json or "[]"),[r[0] for r in failed_rows]
 
     async def shutdown_all(self):
         for cid in list(self.apps):
@@ -1036,8 +1113,9 @@ async def child_check_joined(update,ctx):
     q=update.callback_query; cid=ctx.application.bot_data.get("child_id"); uid=q.from_user.id
     if not cid: return await q.answer("Unavailable",show_alert=True)
     if child_user_status(cid,uid)=="blocked": return await q.answer("🚫 You are blocked.",show_alert=True)
-    await q.answer(); rows=child_rows(cid,True)
+    rows=child_rows(cid,True)
     if not rows:
+        await q.answer()
         return await q.edit_message_text(child_setting(cid,"postjoin",DEFAULT_CHILD_SETTINGS["postjoin"]),reply_markup=child_build_main_kb(cid),parse_mode=ParseMode.HTML)
     joined=set()
     for r in rows:
@@ -1046,6 +1124,7 @@ async def child_check_joined(update,ctx):
             if m.status in ("member","administrator","creator","restricted"): joined.add(r[1])
         except TelegramError: pass
     if len(joined)==len(rows):
+        await q.answer()
         await q.edit_message_text(child_setting(cid,"postjoin"),reply_markup=child_build_main_kb(cid),parse_mode=ParseMode.HTML)
     else:
         await q.answer("🚫 Please join every required channel.",show_alert=True)
@@ -1081,6 +1160,7 @@ async def child_start(update,ctx):
 async def child_main_callback(update,ctx):
     q=update.callback_query; cid=ctx.application.bot_data.get("child_id"); uid=q.from_user.id
     if not cid: return
+    child_add_user(cid,q.from_user)
     if child_user_status(cid,uid)=="blocked": return await q.answer("🚫 You are blocked.",show_alert=True)
     await q.answer(); key=(q.data or "").split(":",1)[-1]
     if key=="back":
@@ -1159,7 +1239,7 @@ async def owner_clone_callback(update,ctx,callback_data=None):
         return
     # Reject starts a reason flow; store target in owner's user_data only.
     ctx.user_data["reject_request_id"]=rid
-    await q.answer(); await q.edit_message_text("❌ <b>REJECT CHILD BOT</b>\n\nPlease enter the reason for rejection.",reply_markup=cancel_kb("reject_cancel"),parse_mode=ParseMode.HTML)
+    await q.edit_message_text("❌ <b>REJECT CHILD BOT</b>\n\nPlease enter the reason for rejection.",reply_markup=cancel_kb("reject_cancel"),parse_mode=ParseMode.HTML)
     return S_REJECT_REASON
 
 
@@ -1293,6 +1373,20 @@ async def requester_create_callback(update,ctx):
         return ConversationHandler.END
     return S_CREATE_ADMIN_ID
 
+async def requester_creation_message_router(update,ctx):
+    """Entry-point router for create requests when no conversation is active."""
+    if not update.message or not update.message.text or not update.effective_user:
+        return ConversationHandler.END
+    req=active_clone_request(update.effective_user.id)
+    if not req:
+        return ConversationHandler.END
+    status=req[2]
+    if status=="approved_waiting_token":
+        return await requester_token_message(update,ctx)
+    if status=="configuring":
+        return await requester_admin_id_message(update,ctx)
+    return ConversationHandler.END
+
 # =========================================================
 # Broadcast payload / keyboard builder
 # =========================================================
@@ -1418,27 +1512,69 @@ def bcast_create(child_id, kind, total, source_chat=0, source_mid=0, payload=Non
 
 async def child_broadcast(manager,child_id,payload,buttons,bid=None,status_msg=None):
     if child_id not in manager.apps:
-        await manager.start_child_bot(child_id)
+        ok=await manager.start_child_bot(child_id)
+        if not ok:
+            raise RuntimeError("Child bot could not be started")
     app=manager.apps.get(child_id)
-    if not app: raise RuntimeError("Child bot is not running")
+    if not app:
+        raise RuntimeError("Child bot is not running")
+
+    # Never include blocked users. Keep a stable recipient snapshot for this broadcast.
     recipient_list=child_users(child_id)
     kind=payload_kind(payload)
     if bid is None:
         bid=bcast_create(child_id,kind,len(recipient_list),payload=payload,buttons=buttons)
-    sent=failed=0; cancelled=False
+
+    with db() as con:
+        con.executemany(
+            "INSERT OR IGNORE INTO child_bot_broadcast_recipients(broadcast_id,user_id,status,attempts,last_error,sent_at) VALUES(?,?,?,?,?,?)",
+            [(bid,uid,"pending",0,"","") for uid in recipient_list],
+        )
+
+    sent=failed=cancelled=False
+    sent_count=0
+    failed_count=0
     task=asyncio.current_task()
     try:
         for i,uid in enumerate(recipient_list,1):
-            if task and task.cancelled(): cancelled=True; break
+            if task and task.cancelling():
+                cancelled=True
+                break
+
+            with db() as con:
+                row=con.execute(
+                    "SELECT status FROM child_bot_broadcast_recipients WHERE broadcast_id=? AND user_id=?",
+                    (bid,uid)
+                ).fetchone()
+            if row and row[0]=="sent":
+                continue
+
+            with db() as con:
+                con.execute(
+                    "UPDATE child_bot_broadcast_recipients SET status='sending',attempts=attempts+1,last_error='' WHERE broadcast_id=? AND user_id=?",
+                    (bid,uid)
+                )
+
             try:
                 if kind=="album":
                     result=await send_album(app.bot,uid,payload.get("album",[]),buttons)
                     mids=[getattr(m,"message_id",0) for m in result]
                 else:
-                    m=await send_payload(app.bot,uid,payload,buttons); mids=[getattr(m,"message_id",0)]
+                    m=await send_payload(app.bot,uid,payload,buttons)
+                    mids=[getattr(m,"message_id",0)]
+
                 with db() as con:
-                    for mid in mids: con.execute("INSERT OR IGNORE INTO child_bot_broadcast_messages VALUES(?,?,?)",(bid,uid,mid))
-                sent+=1
+                    for mid in mids:
+                        con.execute(
+                            "INSERT OR IGNORE INTO child_bot_broadcast_messages VALUES(?,?,?)",
+                            (bid,uid,mid)
+                        )
+                    con.execute(
+                        "UPDATE child_bot_broadcast_recipients SET status='sent',sent_at=?,last_error='' WHERE broadcast_id=? AND user_id=?",
+                        (now_iso(),bid,uid)
+                    )
+                sent_count += 1
+
             except RetryAfter as e:
                 await asyncio.sleep(float(e.retry_after)+0.5)
                 try:
@@ -1446,32 +1582,93 @@ async def child_broadcast(manager,child_id,payload,buttons,bid=None,status_msg=N
                         result=await send_album(app.bot,uid,payload.get("album",[]),buttons)
                         mids=[getattr(m,"message_id",0) for m in result]
                     else:
-                        m=await send_payload(app.bot,uid,payload,buttons); mids=[getattr(m,"message_id",0)]
+                        m=await send_payload(app.bot,uid,payload,buttons)
+                        mids=[getattr(m,"message_id",0)]
                     with db() as con:
-                        for mid in mids: con.execute("INSERT OR IGNORE INTO child_bot_broadcast_messages VALUES(?,?,?)",(bid,uid,mid))
-                    sent+=1
-                except Exception as e2: failed+=1; logger.warning("Child broadcast retry %s/%s: %s",child_id,uid,sanitize_error(e2))
+                        for mid in mids:
+                            con.execute(
+                                "INSERT OR IGNORE INTO child_bot_broadcast_messages VALUES(?,?,?)",
+                                (bid,uid,mid)
+                            )
+                        con.execute(
+                            "UPDATE child_bot_broadcast_recipients SET status='sent',sent_at=?,last_error='' WHERE broadcast_id=? AND user_id=?",
+                            (now_iso(),bid,uid)
+                        )
+                    sent_count += 1
+                except Exception as e2:
+                    err=sanitize_error(e2)
+                    with db() as con:
+                        con.execute(
+                            "UPDATE child_bot_broadcast_recipients SET status='failed',last_error=? WHERE broadcast_id=? AND user_id=?",
+                            (err,bid,uid)
+                        )
+                    failed_count += 1
+                    logger.warning("Child broadcast retry %s/%s: %s",child_id,uid,err)
+
             except Forbidden:
-                failed+=1; child_set_status(child_id,uid,"inactive")
+                child_set_status(child_id,uid,"inactive")
+                with db() as con:
+                    con.execute(
+                        "UPDATE child_bot_broadcast_recipients SET status='failed',last_error=? WHERE broadcast_id=? AND user_id=?",
+                        ("forbidden/inactive",bid,uid)
+                    )
+                failed_count += 1
+
             except TelegramError as e:
-                failed+=1; logger.warning("Child broadcast %s/%s: %s",child_id,uid,sanitize_error(e))
+                err=sanitize_error(e)
+                with db() as con:
+                    con.execute(
+                        "UPDATE child_bot_broadcast_recipients SET status='failed',last_error=? WHERE broadcast_id=? AND user_id=?",
+                        (err,bid,uid)
+                    )
+                failed_count += 1
+                logger.warning("Child broadcast %s/%s: %s",child_id,uid,err)
+
             if status_msg and (i%25==0 or i==len(recipient_list)):
                 try:
-                    await status_msg.edit_text(f"📣 <b>Broadcasting via @{esc((child_get(child_id) or [0,0,''])[2] or 'child')}</b>\n\nProgress: <b>{i}/{len(recipient_list)}</b>\n✅ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=InlineKeyboardMarkup([[ib("⏹ Cancel Broadcast",f"cb:cancelbc:{bid}",style="danger")]]),parse_mode=ParseMode.HTML)
-                except TelegramError: pass
-            if i%25==0: touch_child(child_id)
+                    await status_msg.edit_text(
+                        f"📣 <b>Broadcasting via @{esc((child_get(child_id) or [0,0,''])[2] or 'child')}</b>\n\n"
+                        f"Progress: <b>{i}/{len(recipient_list)}</b>\n✅ Sent: <b>{sent_count}</b>\n❌ Failed: <b>{failed_count}</b>",
+                        reply_markup=InlineKeyboardMarkup([[ib("⏹ Cancel Broadcast",f"cb:cancelbc:{bid}",style="danger")]]),
+                        parse_mode=ParseMode.HTML
+                    )
+                except TelegramError:
+                    pass
+            if i%25==0:
+                touch_child(child_id)
             await asyncio.sleep(0.08)
+
     except asyncio.CancelledError:
         cancelled=True
         raise
     finally:
         status="cancelled" if cancelled else "completed"
-        with db() as con: con.execute("UPDATE child_bot_broadcasts SET sent=?,failed=?,cancelled=?,status=?,completed_at=? WHERE broadcast_id=?",(sent,failed,int(cancelled),status,now_iso(),bid))
+        with db() as con:
+            con.execute(
+                "UPDATE child_bot_broadcasts SET sent=?,failed=?,cancelled=?,status=?,completed_at=? WHERE broadcast_id=?",
+                (sent_count,failed_count,int(cancelled),status,now_iso(),bid)
+            )
         if status_msg:
             try:
-                await status_msg.edit_text(f"{'⏹' if cancelled else '✅'} <b>BROADCAST {status.upper()}</b>\n\nTotal: <b>{len(recipient_list)}</b>\n✅ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=InlineKeyboardMarkup([[ib("🔁 Retry Failed",f"cb:retryb:{child_id}:{bid}",style="success")],[ib("🔙 Back",f"cb:select:{child_id}")]]),parse_mode=ParseMode.HTML)
-            except TelegramError: pass
-    return {"broadcast_id":bid,"total":len(recipient_list),"sent":sent,"failed":failed,"cancelled":cancelled,"status":status}
+                await status_msg.edit_text(
+                    f"{'⏹' if cancelled else '✅'} <b>BROADCAST {status.upper()}</b>\n\n"
+                    f"Total: <b>{len(recipient_list)}</b>\n✅ Sent: <b>{sent_count}</b>\n❌ Failed: <b>{failed_count}</b>",
+                    reply_markup=InlineKeyboardMarkup([
+                        [ib("🔁 Retry Failed",f"cb:retryb:{child_id}:{bid}",style="success")],
+                        [ib("🔙 Back",f"cb:select:{child_id}")]
+                    ]),
+                    parse_mode=ParseMode.HTML
+                )
+            except TelegramError:
+                pass
+    return {
+        "broadcast_id":bid,
+        "total":len(recipient_list),
+        "sent":sent_count,
+        "failed":failed_count,
+        "cancelled":cancelled,
+        "status":status,
+    }
 
 # =========================================================
 # Master dashboard / child panel
@@ -1571,7 +1768,7 @@ def validate_backup(path):
             with sqlite3.connect(p) as con:
                 ok=con.execute("PRAGMA integrity_check").fetchone()[0]
                 tables={r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            req={"users","channels","settings","join_requests","broadcast_msgs","broadcasts","error_logs","child_bots","clone_requests","child_bot_settings","child_bot_admins"}
+            req={"users","channels","settings","join_requests","broadcast_msgs","broadcasts","error_logs","child_bots","clone_requests","child_bot_settings","child_bot_admins","child_bot_users","child_bot_channels","child_bot_buttons","child_bot_broadcasts","child_bot_broadcast_messages","child_bot_broadcast_recipients","child_bot_logs"}
             if ok!="ok" or not req.issubset(tables): raise ValueError("Database integrity/required tables validation failed.")
 
 
@@ -1590,7 +1787,7 @@ def create_backup():
 def validate_backup_from_db(p):
     with sqlite3.connect(p) as con:
         ok=con.execute("PRAGMA integrity_check").fetchone()[0]; tables={r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    req={"users","channels","settings","join_requests","broadcast_msgs","broadcasts","error_logs","child_bots","child_bot_admins","clone_requests","child_bot_users","child_bot_channels","child_bot_settings","child_bot_buttons","child_bot_broadcasts","child_bot_broadcast_messages","child_bot_logs"}
+    req={"users","channels","settings","join_requests","broadcast_msgs","broadcasts","error_logs","child_bots","child_bot_admins","clone_requests","child_bot_users","child_bot_channels","child_bot_settings","child_bot_buttons","child_bot_broadcasts","child_bot_broadcast_messages","child_bot_broadcast_recipients","child_bot_logs"}
     if ok!="ok" or not req.issubset(tables): raise ValueError("Database integrity/required tables validation failed.")
 
 
@@ -1776,6 +1973,16 @@ async def start_bcast(update,ctx):
     LEGACY_BROADCAST_TASK=asyncio.create_task(runner())
     return ConversationHandler.END
 
+async def render_master_channels(q):
+    text="📢 <b>CHANNEL MANAGEMENT</b>\n\n"+(
+        "\n".join(
+            f"{i}. {'🟢' if r[6] else '🔴'} <b>{esc(r[2])}</b>\nID: <code>{esc(r[1])}</code>\nLink: {esc(r[3])}"
+            for i,r in enumerate(channels(True),1)
+        ) or "No channels configured."
+    )
+    await q.edit_message_text(text,reply_markup=ch_kb(),parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
+
 # =========================================================
 # Master admin callback (legacy + child system)
 # =========================================================
@@ -1792,17 +1999,23 @@ async def admin_cb(update,ctx,callback_data=None):
         if d in ("a_back","a_dash"):
             await q.edit_message_text(dash(),reply_markup=admin_kb(),parse_mode=ParseMode.HTML); return ConversationHandler.END
         if d=="a_close": await q.edit_message_text("❌ Admin panel closed."); return ConversationHandler.END
-        if d=="a_chs": await q.edit_message_text("📢 <b>CHANNEL MANAGEMENT</b>\n\n"+"\n".join(f"{i}. {'🟢' if r[6] else '🔴'} <b>{esc(r[2])}</b>\nID: <code>{esc(r[1])}</code>\nLink: {esc(r[3])}" for i,r in enumerate(channels(True),1)) or "No channels configured.",reply_markup=ch_kb(),parse_mode=ParseMode.HTML); return ConversationHandler.END
+        if d=="a_chs": return await render_master_channels(q)
         if d=="a_addch": await q.edit_message_text("📢 <b>Add Channel</b>\n\nSend Channel ID.",parse_mode=ParseMode.HTML); return S_CH_ID
         if d.startswith("a_delc_"):
             cid=int(d.split("_")[-1]); ctx.user_data["confirm"]=('delc',cid); await q.edit_message_text("⚠️ <b>Are you sure?</b>\n\nDelete this channel?",reply_markup=InlineKeyboardMarkup([[ib("✅ Confirm",f"a_confirm_{cid}",style="danger"),ib("❌ Cancel","a_chs")]]),parse_mode=ParseMode.HTML); return ConversationHandler.END
         if d.startswith("a_confirm_"):
             cid=int(d.split("_")[-1]); a,t=ctx.user_data.pop("confirm",("",None));
             if a=="delc" and t==cid: delete_channel(cid)
-            return await admin_cb(type("Obj",(),{"callback_query":type("Q",(),{"data":"a_chs","from_user":q.from_user,"edit_message_text":q.edit_message_text,"answer":q.answer})()})(),ctx)
-        if d.startswith("a_left_"): move_channel(int(d.split("_")[-1]),"left"); return await admin_cb(update,ctx,callback_data="a_chs")
-        if d.startswith("a_right_"): move_channel(int(d.split("_")[-1]),"right"); return await admin_cb(update,ctx,callback_data="a_chs")
-        if d.startswith("a_togglec_"): toggle_channel(int(d.split("_")[-1])); return await admin_cb(update,ctx,callback_data="a_chs")
+            return await render_master_channels(q)
+        if d.startswith("a_left_"):
+            move_channel(int(d.split("_")[-1]),"left")
+            return await render_master_channels(q)
+        if d.startswith("a_right_"):
+            move_channel(int(d.split("_")[-1]),"right")
+            return await render_master_channels(q)
+        if d.startswith("a_togglec_"):
+            toggle_channel(int(d.split("_")[-1]))
+            return await render_master_channels(q)
         if d.startswith("a_testc_"):
             r=channel(int(d.split("_")[-1])); ok,adm,title,status=await channel_status(ctx.bot,r[1]); await q.edit_message_text(f"🧪 <b>Channel Status</b>\n\nName: <b>{esc(r[2])}</b>\nAccessible: {'✅ YES' if ok else '❌ NO'}\nBot Admin: {'✅ YES' if adm else '❌ NO'}\nStatus: <code>{esc(status)}</code>",reply_markup=back_kb("a_chs"),parse_mode=ParseMode.HTML); return ConversationHandler.END
         if d.startswith("a_editc_"): ctx.user_data["edit_channel"]=int(d.split("_")[-1]); await q.edit_message_text("✏️ Send new channel name:"); return S_EDITNAME
@@ -1955,6 +2168,7 @@ async def admin_cb(update,ctx,callback_data=None):
             return ConversationHandler.END
         if d.startswith("cb:users:"): return await child_users_screen(q,int(d.split(":")[-1]))
         if d.startswith("cb:channels:"): return await child_channels_screen(q,int(d.split(":")[-1]))
+        if d.startswith("cb:settings:"): return await child_settings_screen(q,int(d.split(":")[-1]))
         if d.startswith("child:chadd:"):
             cid=int(d.split(":")[-1])
             ctx.user_data["child_channel_child_id"]=cid
@@ -1979,8 +2193,30 @@ async def admin_cb(update,ctx,callback_data=None):
                     with db() as con:
                         con.execute("UPDATE child_bot_channels SET order_num=? WHERE id=?",(rows[j][5],rows[i][0])); con.execute("UPDATE child_bot_channels SET order_num=? WHERE id=?",(rows[i][5],rows[j][0]))
             return await child_channels_screen(q,cid)
+        if d.startswith("child:chtest:"):
+            cid,rowid=map(int,d.split(":")[-2:])
+            r=child_get(cid)
+            if not r: return await q.answer("Child bot not found.",show_alert=True)
+            ch=None
+            with db() as con:
+                ch=con.execute(
+                    "SELECT channel_id,channel_name FROM child_bot_channels WHERE child_bot_id=? AND id=?",
+                    (cid,rowid)
+                ).fetchone()
+            if not ch: return await q.answer("Channel not found.",show_alert=True)
+            try:
+                ok,adm,title,status=await channel_status(MANAGER.apps[cid].bot,ch[0])
+                result=f"Accessible: {'✅ YES' if ok else '❌ NO'}\nBot Admin: {'✅ YES' if adm else '❌ NO'}\nStatus: {esc(status)}"
+            except (KeyError,AttributeError,TelegramError) as e:
+                result=f"❌ Child runtime unavailable: {esc(sanitize_error(e))}"
+            await q.edit_message_text(
+                f"🧪 <b>CHANNEL TEST</b>\n\n{esc(ch[1])}\n{result}",
+                reply_markup=back_kb(f"cb:channels:{cid}"),
+                parse_mode=ParseMode.HTML
+            )
+            return ConversationHandler.END
         if d.startswith("child:chdelete:"):
-            cid,rowid=map(int,d.split(":")[-2:]);
+            cid,rowid=map(int,d.split(":")[-2:])
             with db() as con: con.execute("DELETE FROM child_bot_channels WHERE child_bot_id=? AND id=?",(cid,rowid))
             return await child_channels_screen(q,cid)
         if d.startswith("cb:buttons:"): return await child_buttons_screen(q,int(d.split(":")[-1]))
@@ -2016,41 +2252,137 @@ async def admin_cb(update,ctx,callback_data=None):
             # Temporary restriction to failed IDs is carried through the payload and consumed by task runner.
             retry_bid=uuid.uuid4().hex[:16]
             with db() as con:
-                con.execute("INSERT INTO child_bot_broadcasts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(retry_bid,child_id,0,0,payload_kind(payload)+"_retry",len(failed_ids),0,0,0,"running",now_iso(),"",json.dumps(payload,separators=(",",":")),json.dumps(buttons,separators=(",",":"))))
+                con.execute(
+                    "INSERT INTO child_bot_broadcasts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        retry_bid,child_id,0,0,payload_kind(payload)+"_retry",len(failed_ids),
+                        0,0,0,"running",now_iso(),"",
+                        json.dumps(payload,separators=(",",":")),
+                        json.dumps(buttons,separators=(",",":"))
+                    )
+                )
+                con.executemany(
+                    "INSERT INTO child_bot_broadcast_recipients(broadcast_id,user_id,status,attempts,last_error,sent_at) VALUES(?,?,?,?,?,?)",
+                    [(retry_bid,uid,"pending",0,"","") for uid in failed_ids]
+                )
+
             async def retry_task():
                 app=MANAGER.apps.get(child_id)
-                if not app: await MANAGER.start_child_bot(child_id); app=MANAGER.apps.get(child_id)
-                if not app: raise RuntimeError("Child bot is not running")
+                if not app:
+                    await MANAGER.start_child_bot(child_id)
+                    app=MANAGER.apps.get(child_id)
+                if not app:
+                    raise RuntimeError("Child bot is not running")
                 sent=failed=0
+                kind=payload_kind(payload)
                 try:
                     for i,uid in enumerate(failed_ids,1):
+                        with db() as con:
+                            con.execute(
+                                "UPDATE child_bot_broadcast_recipients SET status='sending',attempts=attempts+1,last_error='' WHERE broadcast_id=? AND user_id=?",
+                                (retry_bid,uid)
+                            )
                         try:
-                            m=await send_payload(app.bot,uid,payload,buttons); mid=getattr(m,"message_id",0)
-                            with db() as con: con.execute("INSERT OR IGNORE INTO child_bot_broadcast_messages VALUES(?,?,?)",(retry_bid,uid,mid))
+                            if kind=="album":
+                                result=await send_album(app.bot,uid,payload.get("album",[]),buttons)
+                                mids=[getattr(m,"message_id",0) for m in result]
+                            else:
+                                m=await send_payload(app.bot,uid,payload,buttons)
+                                mids=[getattr(m,"message_id",0)]
+                            with db() as con:
+                                for mid in mids:
+                                    con.execute("INSERT OR IGNORE INTO child_bot_broadcast_messages VALUES(?,?,?)",(retry_bid,uid,mid))
+                                con.execute(
+                                    "UPDATE child_bot_broadcast_recipients SET status='sent',sent_at=?,last_error='' WHERE broadcast_id=? AND user_id=?",
+                                    (now_iso(),retry_bid,uid)
+                                )
                             sent+=1
                         except RetryAfter as e:
                             await asyncio.sleep(float(e.retry_after)+0.5)
                             try:
-                                m=await send_payload(app.bot,uid,payload,buttons); mid=getattr(m,"message_id",0)
-                                with db() as con: con.execute("INSERT OR IGNORE INTO child_bot_broadcast_messages VALUES(?,?,?)",(retry_bid,uid,mid))
+                                if kind=="album":
+                                    result=await send_album(app.bot,uid,payload.get("album",[]),buttons)
+                                    mids=[getattr(m,"message_id",0) for m in result]
+                                else:
+                                    m=await send_payload(app.bot,uid,payload,buttons)
+                                    mids=[getattr(m,"message_id",0)]
+                                with db() as con:
+                                    for mid in mids:
+                                        con.execute("INSERT OR IGNORE INTO child_bot_broadcast_messages VALUES(?,?,?)",(retry_bid,uid,mid))
+                                    con.execute(
+                                        "UPDATE child_bot_broadcast_recipients SET status='sent',sent_at=?,last_error='' WHERE broadcast_id=? AND user_id=?",
+                                        (now_iso(),retry_bid,uid)
+                                    )
                                 sent+=1
-                            except Exception: failed+=1
-                        except Forbidden: failed+=1; child_set_status(child_id,uid,"inactive")
-                        except TelegramError as e: failed+=1; logger.warning("Retry broadcast %s/%s: %s",child_id,uid,sanitize_error(e))
+                            except Exception as e:
+                                failed+=1
+                                with db() as con:
+                                    con.execute(
+                                        "UPDATE child_bot_broadcast_recipients SET status='failed',last_error=? WHERE broadcast_id=? AND user_id=?",
+                                        (sanitize_error(e),retry_bid,uid)
+                                    )
+                        except Forbidden:
+                            failed+=1
+                            child_set_status(child_id,uid,"inactive")
+                            with db() as con:
+                                con.execute(
+                                    "UPDATE child_bot_broadcast_recipients SET status='failed',last_error=? WHERE broadcast_id=? AND user_id=?",
+                                    ("forbidden/inactive",retry_bid,uid)
+                                )
+                        except TelegramError as e:
+                            failed+=1
+                            err=sanitize_error(e)
+                            with db() as con:
+                                con.execute(
+                                    "UPDATE child_bot_broadcast_recipients SET status='failed',last_error=? WHERE broadcast_id=? AND user_id=?",
+                                    (err,retry_bid,uid)
+                                )
                         if i%10==0 or i==len(failed_ids):
-                            try: await status.edit_text(f"🔁 <b>Retrying...</b>\n\nProgress: <b>{i}/{len(failed_ids)}</b>\n✅ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",parse_mode=ParseMode.HTML)
-                            except TelegramError: pass
+                            try:
+                                await status.edit_text(
+                                    f"🔁 <b>Retrying...</b>\\n\\nProgress: <b>{i}/{len(failed_ids)}</b>\\n✅ Sent: <b>{sent}</b>\\n❌ Failed: <b>{failed}</b>",
+                                    parse_mode=ParseMode.HTML
+                                )
+                            except TelegramError:
+                                pass
                         await asyncio.sleep(0.08)
                 except asyncio.CancelledError:
-                    with db() as con: con.execute("UPDATE child_bot_broadcasts SET status='cancelled',cancelled=1,completed_at=? WHERE broadcast_id=?",(now_iso(),retry_bid))
+                    with db() as con:
+                        con.execute(
+                            "UPDATE child_bot_broadcast_recipients SET status='cancelled' WHERE broadcast_id=? AND status IN ('pending','sending')",
+                            (retry_bid,)
+                        )
+                        con.execute(
+                            "UPDATE child_bot_broadcasts SET sent=?,failed=?,status='cancelled',cancelled=1,completed_at=? WHERE broadcast_id=?",
+                            (sent,failed,now_iso(),retry_bid)
+                        )
                     raise
-                status_text="completed"
-                with db() as con: con.execute("UPDATE child_bot_broadcasts SET sent=?,failed=?,status=?,completed_at=? WHERE broadcast_id=?",(sent,failed,status_text,now_iso(),retry_bid))
-                try: await status.edit_text(f"✅ <b>RETRY COMPLETED</b>\n\nTotal: <b>{len(failed_ids)}</b>\n✅ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=back_kb(f"cb:select:{child_id}"),parse_mode=ParseMode.HTML)
-                except TelegramError: pass
-            task=asyncio.create_task(retry_task()); MANAGER.broadcast_tasks[retry_bid]=task; task.add_done_callback(lambda _: MANAGER.broadcast_tasks.pop(retry_bid,None))
+                with db() as con:
+                    con.execute(
+                        "UPDATE child_bot_broadcasts SET sent=?,failed=?,status='completed',completed_at=? WHERE broadcast_id=?",
+                        (sent,failed,now_iso(),retry_bid)
+                    )
+                try:
+                    await status.edit_text(
+                        f"✅ <b>RETRY COMPLETED</b>\\n\\nTotal: <b>{len(failed_ids)}</b>\\n✅ Sent: <b>{sent}</b>\\n❌ Failed: <b>{failed}</b>",
+                        reply_markup=back_kb(f"cb:select:{child_id}"),
+                        parse_mode=ParseMode.HTML
+                    )
+                except TelegramError:
+                    pass
+
+            task=asyncio.create_task(retry_task())
+            MANAGER.broadcast_tasks[retry_bid]=task
+            task.add_done_callback(lambda _: MANAGER.broadcast_tasks.pop(retry_bid,None))
             return ConversationHandler.END
         if d.startswith("cb:adminchange:"): ctx.user_data["child_admin_target"]=int(d.split(":")[-1]); await q.edit_message_text("👑 Send Admin ID.",reply_markup=back_kb("a_child")); return S_CHILD_ADMIN_ID
+        if d.startswith("cb:setting:"):
+            _,_,cid_s,key=d.split(":",3)
+            cid=int(cid_s)
+            if key not in ("force_join_enabled","maintenance_mode","broadcast_enabled"):
+                return await q.answer("Invalid setting.",show_alert=True)
+            set_child_setting(cid,key,"0" if child_setting(cid,key,"0")=="1" else "1")
+            return await child_settings_screen(q,cid)
         if d=="cb:global": ctx.user_data["global_child_selection"]=[]; return await global_child_select_screen(q,ctx)
         if d.startswith("cb:globtoggle:"):
             cid=int(d.split(":")[-1]); selected=set(ctx.user_data.get("global_child_selection",[])); selected.remove(cid) if cid in selected else selected.add(cid); ctx.user_data["global_child_selection"]=list(selected); return await global_child_select_screen(q,ctx)
@@ -2066,7 +2398,22 @@ async def admin_cb(update,ctx,callback_data=None):
         if d.startswith("cadmin:add:"):
             ctx.user_data["admin_child_id"]=int(d.split(":")[-1]); await q.edit_message_text("➕ Send admin Telegram user ID.",reply_markup=back_kb("a_child")); return S_CHILD_ADMIN_ID
         if d.startswith("cadmin:remove:"):
-            cid=int(d.split(":")[-2]); uid=int(d.split(":")[-1]); remove_child_admin(cid,uid); return await child_admin_screen(q,cid)
+            cid=int(d.split(":")[-2]); uid=int(d.split(":")[-1])
+            remove_child_admin(cid,uid)
+            return await child_admin_screen(q,cid)
+        if d.startswith("cadmin:toggle:"):
+            cid=int(d.split(":")[-2]); uid=int(d.split(":")[-1])
+            rows=child_admins(cid)
+            role=next((r[2] for r in rows if r[1]==uid),None)
+            if role=="CHILD_OWNER":
+                return await q.answer("Child owner cannot be changed.",show_alert=True)
+            if role=="CHILD_ADMIN":
+                with db() as con:
+                    con.execute("UPDATE child_bot_admins SET role='CHILD_OWNER' WHERE child_bot_id=? AND user_id=?", (cid,uid))
+                # Never allow two owners; revert to admin if another owner exists.
+                with db() as con:
+                    con.execute("UPDATE child_bot_admins SET role='CHILD_ADMIN' WHERE child_bot_id=? AND user_id=? AND EXISTS(SELECT 1 FROM child_bot_admins WHERE child_bot_id=? AND user_id!=? AND role='CHILD_OWNER')",(cid,uid,cid,uid))
+            return await child_admin_screen(q,cid)
         if d.startswith("cadmin:list:"): return await child_admin_screen(q,int(d.split(":")[-1]))
         if d.startswith("cadmin:owner:"): return await child_select_screen(q,int(d.split(":")[-1]))
         # Request button callbacks generated directly from clone flow.
@@ -2125,7 +2472,7 @@ async def child_select_screen(q,cid):
     icon={"RUNNING":"🟢","STOPPED":"🔴","ERROR":"⚠️","TOKEN_INVALID":"🔐","CONFIGURING":"🟡"}.get(r[7],"⚪")
     action_start=f"cb:stop:{cid}" if r[7]=="RUNNING" else f"cb:start:{cid}"
     action_label="🔴 Stop" if r[7]=="RUNNING" else "🟢 Start"
-    await q.edit_message_text(f"🤖 <b>@{esc(r[2]) or '—'}</b>\n\nBot ID: <code>{r[1]}</code>\nOwner: <code>{r[6]}</code>\nStatus: {icon} <b>{esc(r[7])}</b>\nUsers: <b>{users_n}</b>\nChannels: <b>{chans}</b>\nBroadcasts: <b>{bcasts}</b>\nAdmins: <b>{len(admins)}</b>\nLast heartbeat: <code>{esc(r[13] or '—')}</code>\nLast error: <code>{esc(r[12] or 'None')}</code>",reply_markup=InlineKeyboardMarkup([[ib("📣 Broadcast",f"cb:broadcast:{cid}",style="success"),ib(action_label,action_label and action_start,style="danger" if r[7]=="RUNNING" else "success")],[ib("🔄 Restart",f"cb:restart:{cid}")],[ib("👥 Users",f"cb:users:{cid}"),ib("📢 Channels",f"cb:channels:{cid}")],[ib("🎨 Buttons",f"cb:buttons:{cid}"),ib("👑 Admins",f"cb:admins:{cid}")],[ib("🩺 Health",f"cb:health:{cid}"),ib("🗑 Remove",f"cb:remove:{cid}",style="danger")],[ib("🔙 Back","cb:list:all")]]),parse_mode=ParseMode.HTML); return ConversationHandler.END
+    await q.edit_message_text(f"🤖 <b>@{esc(r[2]) or '—'}</b>\n\nBot ID: <code>{r[1]}</code>\nOwner: <code>{r[6]}</code>\nStatus: {icon} <b>{esc(r[7])}</b>\nUsers: <b>{users_n}</b>\nChannels: <b>{chans}</b>\nBroadcasts: <b>{bcasts}</b>\nAdmins: <b>{len(admins)}</b>\nLast heartbeat: <code>{esc(r[13] or '—')}</code>\nLast error: <code>{esc(r[12] or 'None')}</code>",reply_markup=InlineKeyboardMarkup([[ib("📣 Broadcast",f"cb:broadcast:{cid}",style="success"),ib(action_label,action_label and action_start,style="danger" if r[7]=="RUNNING" else "success")],[ib("🔄 Restart",f"cb:restart:{cid}")],[ib("👥 Users",f"cb:users:{cid}"),ib("📢 Channels",f"cb:channels:{cid}")],[ib("🎨 Buttons",f"cb:buttons:{cid}"),ib("👑 Admins",f"cb:admins:{cid}")],[ib("🩺 Health",f"cb:health:{cid}"),ib("⚙️ Settings",f"cb:settings:{cid}")],[ib("🗑 Remove",f"cb:remove:{cid}",style="danger")],[ib("🔙 Back","cb:list:all")]]),parse_mode=ParseMode.HTML); return ConversationHandler.END
 
 async def child_health_screen(q,cid):
     r=child_get(cid)
@@ -2140,7 +2487,16 @@ async def child_channels_screen(q,cid):
     rows=child_rows(cid); text="📢 <b>CHANNELS</b>\n\n"; buttons=[]
     for r in rows:
         text+=f"{r[0]}. {'🟢' if r[6] else '🔴'} <b>{esc(r[2])}</b> · <code>{esc(r[1])}</code>\n   {esc(r[3])}\n"
-        buttons.append([ib(("🔴 Disable" if r[6] else "🟢 Enable"),f"child:chtoggle:{cid}:{r[0]}"),ib("🗑 Delete",f"child:chdelete:{cid}:{r[0]}",style="danger")])
+        buttons.append([
+            ib(("🔴 Disable" if r[6] else "🟢 Enable"),f"child:chtoggle:{cid}:{r[0]}"),
+            ib("✏️ Edit",f"child:chedit:{cid}:{r[0]}"),
+            ib("🗑 Delete",f"child:chdelete:{cid}:{r[0]}",style="danger")
+        ])
+        buttons.append([
+            ib("⬆️ Up",f"child:chmove:{cid}:{r[0]}:up"),
+            ib("⬇️ Down",f"child:chmove:{cid}:{r[0]}:down"),
+            ib("🧪 Test",f"child:chtest:{cid}:{r[0]}",style="success")
+        ])
     buttons += [[ib("➕ Add Channel",f"child:chadd:{cid}",style="success")],[ib("🔙 Back",f"cb:select:{cid}")]]
     await q.edit_message_text(text if rows else "📢 <b>CHANNELS</b>\n\nNo channels.",reply_markup=InlineKeyboardMarkup(buttons),parse_mode=ParseMode.HTML); return ConversationHandler.END
 
@@ -2151,6 +2507,27 @@ async def child_buttons_screen(q,cid):
         buttons.append([ib("✏️ Edit "+r[1],f"child:btnedit:{cid}:{r[0]}"),ib("👁 Preview",f"child:btnpreview:{cid}:{r[0]}"),ib(("🔴 Disable" if r[6] else "🟢 Enable"),f"child:btntoggle:{cid}:{r[0]}")])
     buttons += [[ib("↩️ Reset Defaults",f"child:btnreset:{cid}",style="danger")],[ib("🔙 Back",f"cb:select:{cid}")]]
     await q.edit_message_text(text or "No buttons.",reply_markup=InlineKeyboardMarkup(buttons),parse_mode=ParseMode.HTML); return ConversationHandler.END
+
+async def child_settings_screen(q,cid):
+    r=child_get(cid)
+    if not r:
+        return await q.answer("Child bot not found.",show_alert=True)
+    rows=[
+        ("force_join_enabled","Force Join"),
+        ("maintenance_mode","Maintenance"),
+        ("broadcast_enabled","Broadcast"),
+    ]
+    kb=[]
+    for key,label in rows:
+        on=child_setting(cid,key,"0")=="1"
+        kb.append([ib(("🟢 " if on else "🔴 ")+label,f"cb:setting:{cid}:{key}",style="success" if on else "danger")])
+    kb.append([ib("🔙 Back",f"cb:select:{cid}")])
+    await q.edit_message_text(
+        f"⚙️ <b>CHILD SETTINGS</b>\n\nBot: <b>@{esc(r[2]) or '—'}</b>",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode=ParseMode.HTML
+    )
+    return ConversationHandler.END
 
 async def child_admin_screen(q,cid):
     rows=child_admins(cid); text="👑 <b>ADMIN MANAGEMENT</b>\n\n"+"\n".join(f"{r[1]} — <b>{esc(r[2])}</b>" for r in rows) or "No admins."
@@ -2322,9 +2699,16 @@ async def child_message_handler(update,ctx):
     if ctx.user_data.get("child_broadcast_mode") and child_is_authorized(cid,update.effective_user.id):
         payload=snapshot_message(update.message)
         try:
-            result=await child_broadcast(MANAGER,cid,payload,[])
-            await update.message.reply_text(f"📊 Broadcast completed.\nTotal: {result['total']}\n✅ Sent: {result['sent']}\n❌ Failed: {result['failed']}")
-        except Exception as e: await update.message.reply_text("❌ Broadcast failed safely.")
+            status_msg=await update.message.reply_text("⏳ Starting child broadcast...")
+            bid=await MANAGER.start_broadcast_task(cid,payload,[],status_msg)
+            await status_msg.edit_text(
+                f"📣 <b>Child broadcast started</b>\n\nBroadcast ID: <code>{bid}</code>",
+                reply_markup=InlineKeyboardMarkup([[ib("⏹ Cancel Broadcast",f"cb:cancelbc:{bid}",style="danger")]]),
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            await update.message.reply_text("❌ Broadcast failed safely.")
+            log_error("ERROR",f"Child admin broadcast: {sanitize_error(e)}")
         ctx.user_data.clear(); return
     # Ignore ordinary admin chatter; normal user registration happens on /start.
 
@@ -2494,7 +2878,12 @@ def build_master_conversation():
     tf=filters.TEXT & ~filters.COMMAND
     media=filters.ALL & ~filters.COMMAND
     return ConversationHandler(
-        entry_points=[CommandHandler("admin",admin_cmd),CommandHandler("create",create_start),CallbackQueryHandler(admin_cb,pattern=r"^(a_|cb:|cr:|clone:|bcast:|cadmin:|child:)")],
+        entry_points=[
+            CommandHandler("admin",admin_cmd),
+            CommandHandler("create",create_start),
+            MessageHandler(tf,requester_creation_message_router),
+            CallbackQueryHandler(admin_cb,pattern=r"^(a_|cb:|cr:|clone:|bcast:|cadmin:|child:)")
+        ],
         states={
             S_CH_ID:[MessageHandler(tf,s_ch_id)],S_CH_NAME:[MessageHandler(tf,s_ch_name)],S_CH_LINK:[MessageHandler(tf,s_ch_link)],
             S_WELCOME:[MessageHandler(tf,s_welcome)],S_WELCOME_PHOTO:[MessageHandler((filters.PHOTO|filters.TEXT)&~filters.COMMAND,s_photo)],S_POSTJOIN:[MessageHandler(tf,s_postjoin)],S_TOP:[MessageHandler(tf,s_top)],S_BTN1:[MessageHandler(tf,s_btn1)],S_BTN2:[MessageHandler(tf,s_btn2)],S_BTN3:[MessageHandler(tf,s_btn3)],
@@ -2513,12 +2902,16 @@ def build_master_conversation():
 # =========================================================
 
 async def master_extra_callback(update,ctx):
-    # Handles callbacks not safe to nest in the master conversation state machine.
-    d=update.callback_query.data or ""
-    if not is_owner(update.callback_query.from_user.id): return await update.callback_query.answer("❌ Not authorized.",show_alert=True)
-    if d=="a_child": return await child_master_menu(update.callback_query)
-    if d=="a_child_requests": return await child_requests_menu(update.callback_query)
-    if d=="a_child_stats": return await child_stats_screen(update.callback_query)
+    # Callbacks handled here are outside the active master ConversationHandler.
+    q=update.callback_query
+    d=q.data or ""
+    if not is_owner(q.from_user.id):
+        return await q.answer("❌ Not authorized.",show_alert=True)
+    if d in ("a_child","a_child_requests","a_child_stats"):
+        await q.answer()
+        if d=="a_child": return await child_master_menu(q)
+        if d=="a_child_requests": return await child_requests_menu(q)
+        return await child_stats_screen(q)
     if d=="create_cancel": return await create_cancel_cb(update,ctx)
     if d.startswith("clone:"): return await owner_clone_callback(update,ctx)
     if d=="bcast:send": return await master_bcast_send_cb(update,ctx)
@@ -2578,9 +2971,6 @@ def main():
     conv=build_master_conversation()
     app.add_handler(CommandHandler("start",start),group=0)
     app.add_handler(conv,group=1)
-    # Create token/admin message paths outside ConversationHandler when no legacy state owns them.
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, requester_token_message),group=2)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, requester_admin_id_message),group=3)
     app.add_handler(CallbackQueryHandler(master_extra_callback,pattern=r"^(clone:|bcast:send|global:confirm|create_cancel|a_child|a_child_requests|a_child_stats)$"),group=4)
     app.add_handler(CallbackQueryHandler(cb_check,pattern=r"^check_joined$"),group=5)
     app.add_handler(CallbackQueryHandler(cb_btn,pattern=r"^btn[123]$"),group=5)
