@@ -69,6 +69,7 @@ LAST_ERROR = ""
 ERROR_LOG_MAX = 300
 PREMIUM_EMOJI_ENABLED = True
 AUTO_BACKUP_TASK = None
+MASTER_BOT_REF = None
 
 BTN1, BTN2, BTN3 = "🎯 Claim Agent", "📊 Statistics", "🤝 Refer & Earn"
 EMOJI = {
@@ -893,6 +894,9 @@ class ChildBotManager:
         app.add_error_handler(child_error_handler)
 
     async def start_child_bot(self, child_id):
+        record=self.get_child_bot(child_id)
+        if not record:
+            raise ValueError("Child bot not found")
         if child_id in self.apps:
             app=self.apps[child_id]
         else:
@@ -1780,7 +1784,10 @@ async def admin_cb(update,ctx,callback_data=None):
     global PREMIUM_EMOJI_ENABLED, LEGACY_BROADCAST_TASK
     q=update.callback_query
     if not is_owner(q.from_user.id): await q.answer("❌ Not authorized!",show_alert=True); return ConversationHandler.END
-    await q.answer(); d=callback_data if callback_data is not None else (q.data or "")
+    d=callback_data if callback_data is not None else (q.data or "")
+    # owner_clone_callback() owns its callback acknowledgement; do not answer twice.
+    if not (d.startswith("clone:") or d.startswith("cr:approve:") or d.startswith("cr:reject:")):
+        await q.answer()
     try:
         if d in ("a_back","a_dash"):
             await q.edit_message_text(dash(),reply_markup=admin_kb(),parse_mode=ParseMode.HTML); return ConversationHandler.END
@@ -1931,8 +1938,32 @@ async def admin_cb(update,ctx,callback_data=None):
             cid=int(d.split(":")[-1]); await q.edit_message_text("⚠️ <b>REMOVE CHILD BOT</b>\n\nThis stops its runtime and marks it REMOVED. Data is retained in the database.\n\nConfirm?",reply_markup=confirm_cancel_keyboard(f"cb:removeconfirm:{cid}",f"cb:select:{cid}"),parse_mode=ParseMode.HTML); return ConversationHandler.END
         if d.startswith("cb:removeconfirm:"): await MANAGER.remove_child_bot(int(d.split(":")[-1])); return await child_manage_list(q)
         if d.startswith("cb:health:"): return await child_health_screen(q,int(d.split(":")[-1]))
+        if d.startswith("cb:logs:"):
+            cid=int(d.split(":")[-1])
+            with db() as con:
+                log_rows=con.execute(
+                    "SELECT created_at,level,message FROM child_bot_logs WHERE child_bot_id=? ORDER BY id DESC LIMIT 20",
+                    (cid,),
+                ).fetchall()
+            text = "📜 <b>CHILD BOT LOGS</b>\n\n" + (
+                "\n".join(
+                    f"<code>{esc(r[0])}</code> · <b>{esc(r[1])}</b> · {esc(r[2])}"
+                    for r in log_rows
+                ) if log_rows else "No logs."
+            )
+            await q.edit_message_text(text,reply_markup=back_kb(f"cb:health:{cid}"),parse_mode=ParseMode.HTML)
+            return ConversationHandler.END
         if d.startswith("cb:users:"): return await child_users_screen(q,int(d.split(":")[-1]))
         if d.startswith("cb:channels:"): return await child_channels_screen(q,int(d.split(":")[-1]))
+        if d.startswith("child:chadd:"):
+            cid=int(d.split(":")[-1])
+            ctx.user_data["child_channel_child_id"]=cid
+            await q.edit_message_text(
+                "📢 <b>Add Child Channel</b>\n\nSend Channel ID.",
+                reply_markup=cancel_kb("bcast:cancel"),
+                parse_mode=ParseMode.HTML,
+            )
+            return S_CHILD_CHANNEL_ID
         if d.startswith("child:chtoggle:"):
             cid,rowid=map(int,d.split(":")[-2:]);
             with db() as con: con.execute("UPDATE child_bot_channels SET enabled=1-enabled WHERE child_bot_id=? AND id=?",(cid,rowid))
@@ -1967,7 +1998,7 @@ async def admin_cb(update,ctx,callback_data=None):
             with db() as con: con.execute("UPDATE child_bot_buttons SET enabled=1-enabled WHERE child_bot_id=? AND button_key=?",(int(cid),key))
             return await child_buttons_screen(q,int(cid))
         if d.startswith("cb:admins:"): return await child_admin_screen(q,int(d.split(":")[-1]))
-        if d.startswith("cb:broadcast:"): ctx.user_data["selected_child_id"]=int(d.split(":")[-1]); ctx.user_data["bcast_buttons"]=[]; await q.edit_message_text("📣 <b>CHILD BOT BROADCAST</b>\n\nSend the content message now.\nSupported: text, photo, video, document, audio, voice, animation, sticker, video note, location, contact, venue; albums where practical.\n\n[❌ Cancel]",parse_mode=ParseMode.HTML); return S_MASTER_BCAST_CONTENT
+        if d.startswith("cb:broadcast:"): ctx.user_data["selected_child_id"]=int(d.split(":")[-1]); ctx.user_data["broadcast_buttons"]=[]; await q.edit_message_text("📣 <b>CHILD BOT BROADCAST</b>\n\nSend the content message now.\nSupported: text, photo, video, document, audio, voice, animation, sticker, video note, location, contact, venue; albums where practical.\n\n[❌ Cancel]",parse_mode=ParseMode.HTML); return S_MASTER_BCAST_CONTENT
         if d.startswith("cb:cancelbc:"):
             bid=d.split(":")[-1]
             ok=await MANAGER.cancel_broadcast(bid)
@@ -2039,7 +2070,7 @@ async def admin_cb(update,ctx,callback_data=None):
         if d.startswith("cadmin:list:"): return await child_admin_screen(q,int(d.split(":")[-1]))
         if d.startswith("cadmin:owner:"): return await child_select_screen(q,int(d.split(":")[-1]))
         # Request button callbacks generated directly from clone flow.
-        if d.startswith("clone:"): return await owner_clone_callback(q,ctx)
+        if d.startswith("clone:"): return await owner_clone_callback(update,ctx)
         return ConversationHandler.END
     except Exception as e:
         logger.exception("Admin callback failed"); await q.answer("Something went wrong.",show_alert=True); log_error("ERROR",f"Admin callback: {e}"); return ConversationHandler.END
@@ -2139,6 +2170,24 @@ async def global_child_select_screen(q,ctx):
 # =========================================================
 # Master broadcast composer states
 # =========================================================
+
+async def master_bcast_buttons_menu(q,ctx):
+    buttons=ctx.user_data.get("broadcast_buttons",[])
+    rows=[]
+    for row_num,row in enumerate(buttons,1):
+        for idx,b in enumerate(row,1):
+            rows.append(f"{row_num}.{idx} <b>{esc(b.get('text','Button'))}</b> — {esc(b.get('url',''))}")
+    text="🔘 <b>BROADCAST BUTTONS</b>\n\n"+("\n".join(rows) if rows else "No buttons added.")
+    await q.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [ib("➕ Add Button","bcast:add",style="success"),ib("👁 Preview","bcast:preview")],
+            [ib("✅ Done","bcast:done",style="success"),ib("❌ Cancel","bcast:cancel",style="danger")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+    return ConversationHandler.END
+
 
 async def master_bcast_content(update,ctx):
     if not is_owner(update.effective_user.id): return ConversationHandler.END
@@ -2411,7 +2460,8 @@ async def child_health_loop():
 HEALTH_TASK=None
 
 async def post_init(app):
-    global AUTO_BACKUP_TASK, HEALTH_TASK
+    global AUTO_BACKUP_TASK, HEALTH_TASK, MASTER_BOT_REF
+    MASTER_BOT_REF = app.bot
     init_db()
     AUTO_BACKUP_TASK=asyncio.create_task(auto_backup_loop())
     HEALTH_TASK=asyncio.create_task(child_health_loop())
