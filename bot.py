@@ -1,4 +1,6 @@
-import asyncio, csv, html, logging, os, sqlite3, tempfile, time, uuid, zipfile, shutil, sys
+import asyncio, csv, html, logging, os, sqlite3, tempfile, time, uuid, zipfile, shutil, sys, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,9 +15,11 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 try: ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip())
 except ValueError: ADMIN_ID = 0
+try: OWNER_ID = int(os.getenv("OWNER_ID", str(ADMIN_ID)).strip())
+except ValueError: OWNER_ID = ADMIN_ID
 DB_PATH = os.getenv("DB_PATH", "bot2.db").strip() or "bot2.db"
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "backups")); BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-BOT_VERSION, DB_VERSION = "3.0.0", 3
+BOT_VERSION, DB_VERSION = "4.0.0", 4
 STARTED_AT = time.monotonic()
 LAST_ERROR = ""
 ERROR_LOG_MAX = 200
@@ -23,6 +27,8 @@ BROADCAST_TASK = None
 BROADCAST_LOCK = asyncio.Lock()
 AUTO_BACKUP_TASK = None
 PREMIUM_EMOJI_ENABLED = True
+HTTP_SERVER = None
+HTTP_SERVER_THREAD = None
 
 BTN1, BTN2, BTN3 = "🎯 Claim Agent", "📊 Statistics", "🤝 Refer & Earn"
 EMOJI = {"🎯": "5228855127892327218", "📊": "6093382540784046658", "🤝": "6086990448331592466", "📣": "6095891759462617671", "💬": "6095865895169560113", "📝": "6010292709066019210", "🖼️": "5341285075210224047", "➕": "6093406373557571574", "❌": "6010471186432005118", "⚙️": "6010355840790303830", "✅": "6246537187614005254", "🌟": "5783170625090622777", "📌": "6089019283508040459", "🔔": "6093852083788715042", "👑": "6247039939305808563", "💰": "5785325680765965100"}
@@ -88,6 +94,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS broadcast_msgs(bcast_id TEXT NOT NULL,user_id INTEGER NOT NULL,message_id INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS broadcasts(bcast_id TEXT PRIMARY KEY,created_at TEXT,source_chat_id INTEGER,source_message_id INTEGER,kind TEXT,total INTEGER DEFAULT 0,sent INTEGER DEFAULT 0,failed INTEGER DEFAULT 0,cancelled INTEGER DEFAULT 0,status TEXT DEFAULT 'running',last_error TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS error_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT,level TEXT,message TEXT);
+        CREATE TABLE IF NOT EXISTS referrals(referral_id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER UNIQUE NOT NULL,referrer_id INTEGER NOT NULL,created_at TEXT NOT NULL);
         """)
         # Migrate original schema safely.
         cols={r[1] for r in c.execute("PRAGMA table_info(users)")}
@@ -111,7 +118,14 @@ def init_db():
         }
         for k,v in defaults.items(): c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,str(v)))
 
-def is_admin(uid): return bool(ADMIN_ID and uid==ADMIN_ID)
+def control_ids():
+    ids=set()
+    if ADMIN_ID: ids.add(ADMIN_ID)
+    if OWNER_ID: ids.add(OWNER_ID)
+    return ids
+
+def is_admin(uid): return bool(uid in control_ids())
+def is_owner(uid): return bool(OWNER_ID and uid==OWNER_ID)
 
 def add_user(u):
     with db() as c:
@@ -210,6 +224,64 @@ def bstyle(k):
 def bemoji(k):
     return gset("button_emoji_"+k,"") if gset("button_emoji_enabled_"+k,"1")=="1" else None
 
+def referral_count(uid):
+    return scalar("SELECT COUNT(*) FROM referrals WHERE referrer_id=?",(uid,),0)
+
+def referral_link(bot_username, uid):
+    return f"https://t.me/{bot_username}?start={uid}"
+
+async def referral_text(bot, uid):
+    me=await bot.get_me()
+    count=referral_count(uid)
+    target=max(1,int(gset("referral_target","1") or "1"))
+    reward=gset("referral_reward","1")
+    needed=max(0,target-count)
+    link=referral_link(me.username or "",uid)
+    return (
+        "🤩<b>ᴍʏ ʀᴇꜰᴇʀʀᴀʟ ʟɪɴᴋ</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💎 <b>ᴘᴇʀ ʀᴇꜰᴇʀʀ :</b> {esc(reward)}\n\n"
+        f"👥 <b>ʀᴇꜰᴇʀʀᴀʟs :</b> {count}\n\n"
+        f"🎯 <b>ᴛᴀʀɢᴇᴛ :</b> {target}\n\n"
+        f"⏳ <b>ꜱᴛɪʟʟ ɴᴇᴇᴅᴇᴅ :</b> {needed}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔑 <b>ɪɴᴠɪᴛᴀᴛɪᴏɴ ᴄᴏᴅᴇ :</b> <code>{uid}</code>\n\n"
+        f"<code>{esc(link)}</code>\n\n"
+        "📨<b>ꜱʜᴀʀᴇ ᴡɪᴛʜ ꜰʀɪᴇɴᴅs.</b>"
+    )
+
+def referral_kb(link):
+    share_url=("https://t.me/share/url?url="+quote(link,safe=""))+"&text="+quote("Join this bot using my referral link!",safe="")
+    return InlineKeyboardMarkup([[ib("📤 Share Referral Link",url=share_url,style="success",emoji_id=EMOJI["📣"])],[ib("🔙 Back","back_main",style="primary",emoji_id=EMOJI["📌"])]] )
+
+async def show_referral(update,ctx):
+    uid=update.effective_user.id
+    try:
+        me=await ctx.bot.get_me()
+        text=await referral_text(ctx.bot,uid)
+        kb=referral_kb(referral_link(me.username or "",uid))
+        if update.callback_query:
+            q=update.callback_query
+            await q.edit_message_text(text,reply_markup=kb,parse_mode=ParseMode.HTML)
+        else:
+            await update.message.reply_text(text,reply_markup=kb,parse_mode=ParseMode.HTML)
+    except TelegramError as e:
+        logger.error("Referral UI failed: %s",e)
+
+def process_referral(new_user_id, args):
+    if not args: return False
+    code=str(args[0]).strip()
+    if not code.isdigit(): return False
+    referrer_id=int(code)
+    if referrer_id==new_user_id: return False
+    if not scalar("SELECT 1 FROM users WHERE user_id=?",(referrer_id,),0): return False
+    try:
+        with db() as c:
+            c.execute("INSERT INTO referrals(user_id,referrer_id,created_at) VALUES(?,?,?)",(new_user_id,referrer_id,datetime.now().isoformat()))
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
 def main_kb():
     return InlineKeyboardMarkup([[ib(BTN1,"btn1",style=bstyle("btn1"),emoji_id=bemoji("btn1")),ib(BTN2,"btn2",style=bstyle("btn2"),emoji_id=bemoji("btn2"))],[ib(BTN3,"btn3",style=bstyle("btn3"),emoji_id=bemoji("btn3"))]])
 def back_kb(cb="a_back"):return InlineKeyboardMarkup([[ib("🔙 Back",cb,style="primary",emoji_id=EMOJI["📌"])]])
@@ -239,7 +311,9 @@ async def send_welcome(bot,chat,text,kb):
 async def start(update,ctx):
     u=update.effective_user
     if not u:return
-    add_user(u)
+    is_new=add_user(u)
+    if is_new and ctx.args:
+        process_referral(u.id,ctx.args)
     if user_status(u.id)=="blocked":return await update.message.reply_text("🚫 You are blocked from using this bot.")
     if gset("maintenance_mode","0")=="1" and not is_admin(u.id):return await update.message.reply_text("🛠 Bot is under maintenance.")
     rows=channels(False);ok,joined=await check_joined(ctx.bot,u.id)
@@ -264,10 +338,23 @@ async def cb_check(update,ctx):
 async def cb_btn(update,ctx):
     q=update.callback_query
     if user_status(q.from_user.id)=="blocked":return await q.answer("🚫 You are blocked.",show_alert=True)
-    await q.answer();k={"btn1":"btn1_msg","btn2":"btn2_msg","btn3":"btn3_msg"}.get(q.data)
+    await q.answer()
+    if q.data=="btn3":
+        return await show_referral(update,ctx)
+    k={"btn1":"btn1_msg","btn2":"btn2_msg"}.get(q.data)
     if not k:return
     try:await q.edit_message_text(gset(k),reply_markup=back_kb("back_main"),parse_mode=ParseMode.HTML)
     except TelegramError:await ctx.bot.send_message(q.message.chat_id,gset(k),reply_markup=back_kb("back_main"),parse_mode=ParseMode.HTML)
+async def cb_ref_share(update,ctx):
+    q=update.callback_query
+    await q.answer()
+    try:
+        me=await ctx.bot.get_me()
+        link=referral_link(me.username or "",q.from_user.id)
+        await q.message.reply_text(f"📨 <b>Share this referral link:</b>\n\n<code>{esc(link)}</code>",parse_mode=ParseMode.HTML)
+    except TelegramError as e:
+        logger.warning("Referral share failed: %s",e)
+
 async def cb_back(update,ctx):
     q=update.callback_query;await q.answer()
     try:await q.edit_message_text(gset("postjoin"),reply_markup=main_kb(),parse_mode=ParseMode.HTML)
@@ -302,6 +389,13 @@ def admin_kb():
 async def admin_cmd(update,ctx):
     if not is_admin(update.effective_user.id):return await update.message.reply_text("❌ Not authorized!")
     await update.message.reply_text(dash(),reply_markup=admin_kb(),parse_mode=ParseMode.HTML)
+
+async def dkboss_cmd(update,ctx):
+    if not is_owner(update.effective_user.id):return await update.message.reply_text("❌ DK BOSS access denied!")
+    await update.message.reply_text(
+        "👑 <b>DK BOSS OWNER PANEL</b>\n\n" + dash(),
+        reply_markup=admin_kb(), parse_mode=ParseMode.HTML
+    )
 
 def ch_kb():
     rows=[]
@@ -367,7 +461,7 @@ def validate_backup(path):
             with z.open("bot2.db") as s:
                 with p.open("wb") as p2: shutil.copyfileobj(s,p2)
             c=sqlite3.connect(p);ok=c.execute("PRAGMA integrity_check").fetchone()[0];tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")};c.close()
-            req={"users","channels","settings","join_requests","broadcast_msgs","broadcasts","error_logs"}
+            req={"users","channels","settings","join_requests","broadcast_msgs","broadcasts","error_logs","referrals"}
             if ok!="ok" or not req.issubset(tables):raise ValueError("Database integrity/required table validation failed.")
 
 def create_backup():
@@ -384,7 +478,7 @@ def create_backup():
 
 def validate_backup_from_db(p):
     c=sqlite3.connect(p);ok=c.execute("PRAGMA integrity_check").fetchone()[0];tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")};c.close()
-    req={"users","channels","settings","join_requests","broadcast_msgs","broadcasts","error_logs"}
+    req={"users","channels","settings","join_requests","broadcast_msgs","broadcasts","error_logs","referrals"}
     if ok!="ok" or not req.issubset(tables):raise ValueError("Database integrity check failed.")
 
 def restore_backup(path):
@@ -806,16 +900,44 @@ async def errors(update,ctx):
             PREMIUM_EMOJI_ENABLED=False
             log_error("ERROR","Premium custom emoji disabled after Telegram rejection: "+str(ctx.error))
 
+class RenderHealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health", "/healthz"):
+            body=("OK\n" if self.path=="/" else "{\"status\":\"ok\"}\n").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json" if self.path!="/" else "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers();self.wfile.write(body);return
+        self.send_response(404);self.end_headers()
+    def log_message(self,format,*args):
+        return
+
+def start_render_health_server():
+    global HTTP_SERVER, HTTP_SERVER_THREAD
+    port=int(os.getenv("PORT","10000"))
+    HTTP_SERVER=ThreadingHTTPServer(("0.0.0.0",port),RenderHealthHandler)
+    HTTP_SERVER.daemon_threads=True
+    HTTP_SERVER_THREAD=threading.Thread(target=HTTP_SERVER.serve_forever,name="render-health",daemon=True)
+    HTTP_SERVER_THREAD.start()
+    logger.info("Render health server listening on 0.0.0.0:%s",port)
+
+def stop_render_health_server():
+    global HTTP_SERVER
+    if HTTP_SERVER is not None:
+        try: HTTP_SERVER.shutdown();HTTP_SERVER.server_close()
+        except Exception: pass
+        HTTP_SERVER=None
+
 def main():
     if not BOT_TOKEN:raise RuntimeError("BOT_TOKEN is missing. Set BOT_TOKEN environment variable.")
     if not ADMIN_ID:raise RuntimeError("ADMIN_ID is missing or invalid. Set ADMIN_ID environment variable.")
     init_db()
-    app=(Application.builder().token(BOT_TOKEN).concurrent_updates(True).post_init(post_init).post_shutdown(post_shutdown).build())
+    app=(Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build())
     tf=filters.TEXT & ~filters.COMMAND
     bf=(filters.TEXT|filters.PHOTO|filters.VIDEO)&~filters.COMMAND
     rf=filters.Document.ALL&~filters.COMMAND
     conv=ConversationHandler(
-      entry_points=[CommandHandler("admin",admin_cmd),CallbackQueryHandler(admin_cb,pattern=r"^a_")],
+      entry_points=[CommandHandler("admin",admin_cmd),CommandHandler("dkboss",dkboss_cmd),CallbackQueryHandler(admin_cb,pattern=r"^a_")],
       states={
         S_CH_ID:[MessageHandler(tf,s_ch_id)],S_CH_NAME:[MessageHandler(tf,s_ch_name)],S_CH_LINK:[MessageHandler(tf,s_ch_link)],
         S_WELCOME:[MessageHandler(tf,s_welcome)],S_WELCOME_PHOTO:[MessageHandler((filters.PHOTO|filters.TEXT)&~filters.COMMAND,s_photo)],
@@ -826,7 +948,11 @@ def main():
     app.add_handler(CommandHandler("start",start));app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(cb_check,pattern=r"^check_joined$"));app.add_handler(CallbackQueryHandler(cb_btn,pattern=r"^btn[123]$"));app.add_handler(CallbackQueryHandler(cb_back,pattern=r"^back_main$"))
     app.add_handler(ChatJoinRequestHandler(join_request));app.add_error_handler(errors)
-    logger.info("Bot started: v%s / PTB %s",BOT_VERSION,telegram.__version__)
-    app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=True)
+    start_render_health_server()
+    logger.info("Bot started: v%s / PTB %s / ADMIN_ID=%s / OWNER_ID=%s",BOT_VERSION,telegram.__version__,ADMIN_ID,OWNER_ID)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=True)
+    finally:
+        stop_render_health_server()
 
 if __name__=="__main__":main()
