@@ -12,8 +12,10 @@ import sqlite3
 import sys
 import tempfile
 import time
+import threading
 import uuid
 import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1132,10 +1134,11 @@ async def create_done_cb(update,ctx):
     await update.callback_query.answer(); return ConversationHandler.END
 
 
-async def owner_clone_callback(update,ctx):
+async def owner_clone_callback(update,ctx,callback_data=None):
     q=update.callback_query
     if not is_owner(q.from_user.id): return await q.answer("❌ Not authorized.",show_alert=True)
-    parts=(q.data or "").split(":")
+    data = callback_data if callback_data is not None else (q.data or "")
+    parts=data.split(":")
     if len(parts)!=3: return await q.answer("Invalid request.",show_alert=True)
     action,rid=parts[1],parts[2]
     req=get_request(rid)
@@ -1773,11 +1776,11 @@ async def start_bcast(update,ctx):
 # Master admin callback (legacy + child system)
 # =========================================================
 
-async def admin_cb(update,ctx):
+async def admin_cb(update,ctx,callback_data=None):
     global PREMIUM_EMOJI_ENABLED, LEGACY_BROADCAST_TASK
     q=update.callback_query
     if not is_owner(q.from_user.id): await q.answer("❌ Not authorized!",show_alert=True); return ConversationHandler.END
-    await q.answer(); d=q.data or ""
+    await q.answer(); d=callback_data if callback_data is not None else (q.data or "")
     try:
         if d in ("a_back","a_dash"):
             await q.edit_message_text(dash(),reply_markup=admin_kb(),parse_mode=ParseMode.HTML); return ConversationHandler.END
@@ -1790,9 +1793,9 @@ async def admin_cb(update,ctx):
             cid=int(d.split("_")[-1]); a,t=ctx.user_data.pop("confirm",("",None));
             if a=="delc" and t==cid: delete_channel(cid)
             return await admin_cb(type("Obj",(),{"callback_query":type("Q",(),{"data":"a_chs","from_user":q.from_user,"edit_message_text":q.edit_message_text,"answer":q.answer})()})(),ctx)
-        if d.startswith("a_left_"): move_channel(int(d.split("_")[-1]),"left"); return await admin_cb(_wrap_query(q,"a_chs"),ctx)
-        if d.startswith("a_right_"): move_channel(int(d.split("_")[-1]),"right"); return await admin_cb(_wrap_query(q,"a_chs"),ctx)
-        if d.startswith("a_togglec_"): toggle_channel(int(d.split("_")[-1])); return await admin_cb(_wrap_query(q,"a_chs"),ctx)
+        if d.startswith("a_left_"): move_channel(int(d.split("_")[-1]),"left"); return await admin_cb(update,ctx,callback_data="a_chs")
+        if d.startswith("a_right_"): move_channel(int(d.split("_")[-1]),"right"); return await admin_cb(update,ctx,callback_data="a_chs")
+        if d.startswith("a_togglec_"): toggle_channel(int(d.split("_")[-1])); return await admin_cb(update,ctx,callback_data="a_chs")
         if d.startswith("a_testc_"):
             r=channel(int(d.split("_")[-1])); ok,adm,title,status=await channel_status(ctx.bot,r[1]); await q.edit_message_text(f"🧪 <b>Channel Status</b>\n\nName: <b>{esc(r[2])}</b>\nAccessible: {'✅ YES' if ok else '❌ NO'}\nBot Admin: {'✅ YES' if adm else '❌ NO'}\nStatus: <code>{esc(status)}</code>",reply_markup=back_kb("a_chs"),parse_mode=ParseMode.HTML); return ConversationHandler.END
         if d.startswith("a_editc_"): ctx.user_data["edit_channel"]=int(d.split("_")[-1]); await q.edit_message_text("✏️ Send new channel name:"); return S_EDITNAME
@@ -1917,8 +1920,8 @@ async def admin_cb(update,ctx):
         if d=="a_child_settings":
             await q.edit_message_text("⚙️ <b>CHILD BOT SETTINGS</b>\n\nSelect a child bot to manage its per-bot configuration.",reply_markup=InlineKeyboardMarkup([[ib("🤖 Select Child Bot","cb:list:all",style="primary")],[ib("🔙 Back","a_child")]]),parse_mode=ParseMode.HTML); return ConversationHandler.END
         if d.startswith("cr:view:"): return await request_view_callback(q, d.split(":",2)[2])
-        if d.startswith("cr:approve:"): return await owner_clone_callback(_wrap_query(q,f"clone:approve:{d.split(':',2)[2]}"),ctx)
-        if d.startswith("cr:reject:"): return await owner_clone_callback(_wrap_query(q,f"clone:reject:{d.split(':',2)[2]}"),ctx)
+        if d.startswith("cr:approve:"): return await owner_clone_callback(update,ctx,callback_data=f"clone:approve:{d.split(":",2)[2]}")
+        if d.startswith("cr:reject:"): return await owner_clone_callback(update,ctx,callback_data=f"clone:reject:{d.split(":",2)[2]}")
         if d.startswith("cb:list:"): return await child_manage_list(q)
         if d.startswith("cb:select:"): return await child_select_screen(q,int(d.split(":")[-1]))
         if d.startswith("cb:start:"): await MANAGER.start_child_bot(int(d.split(":")[-1])); return await child_select_screen(q,int(d.split(":")[-1]))
@@ -2040,11 +2043,6 @@ async def admin_cb(update,ctx):
         return ConversationHandler.END
     except Exception as e:
         logger.exception("Admin callback failed"); await q.answer("Something went wrong.",show_alert=True); log_error("ERROR",f"Admin callback: {e}"); return ConversationHandler.END
-
-
-def _wrap_query(q,data):
-    class W: pass
-    w=W(); w.callback_query=q; w.callback_query.data=data; return w
 
 # =========================================================
 # Child master UI helpers
@@ -2235,10 +2233,10 @@ async def child_admin_cmd(update,ctx):
     await update.message.reply_text(f"⚙️ <b>CHILD ADMIN PANEL</b>\n\nBot: <b>@{esc((child_get(cid) or [0,0,'','',''])[2] if child_get(cid) else '—')}</b>",reply_markup=InlineKeyboardMarkup([[ib("📊 Dashboard","ca:dash")],[ib("📢 Channels","ca:channels")],[ib("📝 Messages","ca:messages")],[ib("🎨 Buttons","ca:buttons")],[ib("📣 Broadcast","ca:broadcast",style="success")],[ib("👥 Users","ca:users")],[ib("❤️ Health","ca:health")],[ib("⚙️ Settings","ca:settings")],[ib("❌ Close","ca:close",style="danger")]]),parse_mode=ParseMode.HTML)
 
 
-async def child_admin_callback(update,ctx):
+async def child_admin_callback(update,ctx,callback_data=None):
     q=update.callback_query; cid=ctx.application.bot_data.get("child_id"); uid=q.from_user.id
     if not cid or not child_is_authorized(cid,uid): return await q.answer("❌ Not authorized.",show_alert=True)
-    await q.answer(); d=q.data or ""
+    await q.answer(); d=callback_data if callback_data is not None else (q.data or "")
     if d=="ca:close": return await q.edit_message_text("❌ Closed.")
     if d=="ca:dash":
         await q.edit_message_text(f"📊 <b>CHILD DASHBOARD</b>\n\nUsers: <b>{scalar('SELECT COUNT(*) FROM child_bot_users WHERE child_bot_id=?',(cid,))}</b>\nChannels: <b>{scalar('SELECT COUNT(*) FROM child_bot_channels WHERE child_bot_id=?',(cid,))}</b>\nBroadcasts: <b>{scalar('SELECT COUNT(*) FROM child_bot_broadcasts WHERE child_bot_id=?',(cid,))}</b>",reply_markup=back_kb("ca:dash"),parse_mode=ParseMode.HTML); return
@@ -2259,7 +2257,7 @@ async def child_admin_callback(update,ctx):
     if d=="ca:broadcast":
         ctx.user_data["child_broadcast_mode"]=True; await q.edit_message_text("📣 Send broadcast content.\n\nText, photo, video, document, audio, voice, animation, sticker, video note supported.",reply_markup=cancel_kb("ca:cancel")); return
     if d.startswith("ca:toggle:"):
-        _,_,target,key=d.split(":",3); set_child_setting(int(target),key,"0" if child_setting(int(target),key,"0")=="1" else "1"); return await child_admin_callback(_wrap_query(q,"ca:settings"),ctx)
+        _,_,target,key=d.split(":",3); set_child_setting(int(target),key,"0" if child_setting(int(target),key,"0")=="1" else "1"); return await child_admin_callback(update,ctx,callback_data="ca:settings")
     if d=="ca:cancel": ctx.user_data.clear(); await q.edit_message_text("❌ Cancelled."); return
 
 async def child_message_handler(update,ctx):
@@ -2481,6 +2479,45 @@ async def master_extra_callback(update,ctx):
 # Main
 # =========================================================
 
+class _RenderHealthHandler(BaseHTTPRequestHandler):
+    def _ok(self):
+        body=b"ok"
+        self.send_response(200)
+        self.send_header("Content-Type","text/plain; charset=utf-8")
+        self.send_header("Content-Length",str(len(body)))
+        self.send_header("Connection","close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self._ok()
+
+    def do_HEAD(self):
+        self._ok()
+
+    def log_message(self,format,*args):
+        return
+
+
+def _start_render_http_server():
+    # Render Free supports Web Services, not free Background Workers. The
+    # Telegram bot itself remains long-polling; this tiny stdlib endpoint only
+    # satisfies Render's required HTTP port. It is enabled only when PORT is set.
+    port_raw=os.getenv("PORT","").strip()
+    if not port_raw:
+        return None
+    try:
+        port=int(port_raw)
+    except ValueError as e:
+        raise RuntimeError("PORT must be a valid integer when running on Render.") from e
+    server=ThreadingHTTPServer(("0.0.0.0",port),_RenderHealthHandler)
+    thread=threading.Thread(target=server.serve_forever,name="render-health",daemon=True)
+    thread.start()
+    logger.info("Render health server listening on 0.0.0.0:%s",port)
+    return server
+
+
 def main():
     if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is missing. Set BOT_TOKEN environment variable.")
     if not OWNER_ID: raise RuntimeError("OWNER_ID/ADMIN_ID is missing or invalid. Set OWNER_ID environment variable.")
@@ -2501,7 +2538,15 @@ def main():
     app.add_handler(ChatJoinRequestHandler(join_request),group=5)
     app.add_error_handler(errors)
     logger.info("Bot started: v%s / PTB %s",BOT_VERSION,telegram.__version__)
-    app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=True)
+    render_server=_start_render_http_server()
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=True)
+    finally:
+        if render_server is not None:
+            try:
+                render_server.shutdown()
+            finally:
+                render_server.server_close()
 
 
 async def errors(update,ctx):
